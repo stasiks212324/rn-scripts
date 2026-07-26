@@ -5,6 +5,10 @@
 
 local CONFIG = {
     NAME       = "Район насилия",
+    -- ВРЕМЕННО: публичная raw-ссылка. Её можно открыть в браузере и списать код
+    -- в обход ключа. После разворачивания воркера (worker.js) заменить на его
+    -- адрес, например "https://zinka.твой-аккаунт.workers.dev"
+    -- и сделать репозиторий приватным. Лоадер сам допишет ?k=КЛЮЧ.
     SCRIPT_URL = "https://raw.githubusercontent.com/stasiks212324/rn-scripts/main/zinka",
 
     -- Обход CDN-кэша (нужно для raw.githubusercontent.com, там кэш ~5 мин).
@@ -17,10 +21,9 @@ local CONFIG = {
     -- ID твоего work.ink АККАУНТА. Главная защита: чужие токены имеют другой userId.
     OWNER_USER_ID = 579838,
 
-    -- ID конкретной ссылки (необязательно). Если задать — примутся только ключи,
-    -- выданные по этой ссылке. Ключи, созданные вручную, имеют linkId = nil,
-    -- поэтому при заданном LINK_ID они работать не будут.
-    LINK_ID    = nil,
+    -- ID твоей work.ink ссылки (work.ink/2qQe/zinka-key).
+    -- Ключи, полученные юзерами через рекламу, несут именно его.
+    LINK_ID    = 4800430,
 
     -- PlaceId = название игры
     ALLOWED_PLACES = {
@@ -28,6 +31,11 @@ local CONFIG = {
     },
 
     KICK_ON_WRONG_PLACE = true,
+
+    -- Кикать, если ключ не введён / не прошёл проверку.
+    -- Сбои не по вине юзера (work.ink лежит, исходник недоступен) не кикают
+    -- никогда — там он всё равно бессилен, а вылет из катки его только взбесит.
+    KICK_ON_NO_KEY      = true,
     KEY_FILE            = "rayon_key.txt",
 }
 
@@ -46,6 +54,10 @@ local UIS         = game:GetService("UserInputService")
 local GuiService  = game:GetService("GuiService")
 local StarterGui  = game:GetService("StarterGui")
 local lp          = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+-- Ключ, прошедший проверку. Уходит раздатчику как параметр ?k=,
+-- иначе тот не отдаст исходник.
+local ACCEPTED_KEY = nil
 
 --== утилиты ==--
 local function notify(text, dur)
@@ -135,15 +147,17 @@ local function validateKey(key)
 
     local info = data.info or {}
 
-    -- ГЛАВНАЯ ПРОВЕРКА: токен должен принадлежать твоему аккаунту.
-    -- Эндпоинт isValid публичный, поэтому без этого подойдёт ЛЮБОЙ чужой work.ink токен.
-    if CONFIG.OWNER_USER_ID and info.userId ~= CONFIG.OWNER_USER_ID then
+    -- ГЛАВНАЯ ПРОВЕРКА. Эндпоинт isValid публичный и ничем не привязан к твоему
+    -- аккаунту: без этой проверки подошёл бы ЛЮБОЙ чужой work.ink токен.
+    --
+    -- Ключи бывают двух видов и несут РАЗНЫЕ поля:
+    --   выданный по ссылке (через рекламу) -> linkId = 4800430, userId = nil
+    --   созданный вручную в Manage         -> userId = 579838,  linkId = nil
+    -- Поэтому принимаем, если совпало хоть одно из двух.
+    local byLink  = CONFIG.LINK_ID      and info.linkId == CONFIG.LINK_ID
+    local byOwner = CONFIG.OWNER_USER_ID and info.userId == CONFIG.OWNER_USER_ID
+    if not (byLink or byOwner) then
         return false, "Ключ выдан не для этого скрипта"
-    end
-
-    -- Необязательное сужение до конкретной ссылки.
-    if CONFIG.LINK_ID and info.linkId ~= CONFIG.LINK_ID then
-        return false, "Ключ выдан для другого проекта"
     end
 
     -- срок действия (expiresAfter — метка времени в миллисекундах)
@@ -487,6 +501,7 @@ local function askKey()
         if ok then
             setStatus(msg, Color3.fromRGB(125, 230, 150))
             okBtn.Text = "Принято ✓"
+            ACCEPTED_KEY = key
             saveKey(key)
             task.wait(0.7)
             shutdown(true)
@@ -522,6 +537,7 @@ if saved then
     local ok, msg = validateKey(saved)
     if ok then
         granted = true
+        ACCEPTED_KEY = saved
         notify(msg, 5)
     else
         clearKey()
@@ -534,7 +550,8 @@ if not granted then
 end
 
 if not granted then
-    stop("Доступ не получен — ключ не введён.", false)
+    stop("Доступ закрыт — ключ не введён.\n\nПолучи ключ здесь:\n" .. CONFIG.KEY_LINK,
+        CONFIG.KICK_ON_NO_KEY)
 end
 
 --==========================================================
@@ -542,14 +559,47 @@ end
 --==========================================================
 notify(("Игра: %s\nЗагрузка скрипта..."):format(placeName), 4)
 
-local scriptUrl = CONFIG.SCRIPT_URL
-if CONFIG.BUST_CACHE then
-    scriptUrl = scriptUrl .. (scriptUrl:find("?") and "&" or "?") .. "v=" .. tostring(os.time())
+local function addParam(url, kv)
+    return url .. (url:find("?") and "&" or "?") .. kv
 end
+
+local scriptUrl = CONFIG.SCRIPT_URL
+-- Ключ уходит раздатчику: без него скрипт не отдадут.
+if ACCEPTED_KEY then scriptUrl = addParam(scriptUrl, "k=" .. ACCEPTED_KEY) end
+if CONFIG.BUST_CACHE then scriptUrl = addParam(scriptUrl, "v=" .. tostring(os.time())) end
 
 local source = httpGet(scriptUrl)
 if not source then stop("Не удалось скачать скрипт. Проверь интернет.", false) end
-if source:match("^%s*<") then stop("Сервер вернул страницу вместо кода. Проверь raw-ссылку.", false) end
+if source:match("^%s*<") then stop("Сервер вернул страницу вместо кода. Проверь ссылку.", false) end
+
+-- Раздатчик отвечает 200 с заглушкой вместо кода ошибки: часть исполнителей
+-- роняет HttpGet на любом не-2xx, и юзер увидел бы ошибку движка вместо текста.
+local denied = source:match("^%-%-%[%[DENIED:([%w]+)%]%]")
+if denied then
+    -- Сбой инфраструктуры или всё-таки плохой ключ? От этого зависит,
+    -- кикать ли и стирать ли сохранённый ключ.
+    local infra = denied:match("^source") or denied == "validator" or denied == "noconfig"
+
+    local reasons = {
+        badkey    = "Ключ не похож на настоящий.",
+        invalid   = "Ключ недействителен или просрочен.",
+        foreign   = "Ключ выдан не для этого скрипта.",
+        expired   = "Срок действия ключа истёк.",
+        validator = "work.ink сейчас недоступен, попробуй позже.",
+        noconfig  = "Раздатчик не настроен — напиши автору.",
+    }
+    local text = reasons[denied] or (infra and "Исходник недоступен — напиши автору."
+                                           or ("Отказано: " .. denied))
+
+    if infra then
+        -- Ключ мог быть нормальным, стирать его не за что.
+        stop(text, false)
+    else
+        clearKey()
+        stop(text .. "\n\nПолучи новый ключ здесь:\n" .. CONFIG.KEY_LINK,
+            CONFIG.KICK_ON_NO_KEY)
+    end
+end
 
 local chunk, compileErr = loadstring(source, "@" .. CONFIG.NAME)
 if not chunk then stop("Ошибка компиляции:\n" .. tostring(compileErr), false) end
